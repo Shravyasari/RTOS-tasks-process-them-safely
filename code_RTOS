@@ -1,0 +1,688 @@
+--------------
+
+code :
+
+
+
+/* USER CODE BEGIN Header */
+
+/**
+
+  ******************************************************************************
+
+  * @file           : main.c
+
+  * @brief          : Main program body (FreeRTOS + UART interrupt + ring buffer)
+
+  ******************************************************************************
+
+  * @attention
+
+  * Copyright (c) 2025 STMicroelectronics.
+
+  * All rights reserved.
+
+  * This software is licensed under terms that can be found in the LICENSE file
+
+  * in the root directory of this software component.
+
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+
+  ******************************************************************************
+
+  */
+
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+
+#include "main.h"
+
+#include "cmsis_os.h"
+
+ 
+
+/* Private includes ----------------------------------------------------------*/
+
+/* USER CODE BEGIN Includes */
+
+#include <stdarg.h>
+
+#include <stdio.h>
+
+#include <string.h>
+
+#include <stdint.h>
+
+/* USER CODE END Includes */
+
+ 
+
+/* Private typedef -----------------------------------------------------------*/
+
+/* USER CODE BEGIN PTD */
+
+typedef struct {
+
+  char msg[64];
+
+} LogItem_t;
+
+/* USER CODE END PTD */
+
+ 
+
+/* Private define ------------------------------------------------------------*/
+
+/* USER CODE BEGIN PD */
+
+#define UART_BUFFER_SIZE 512
+
+/* USER CODE END PD */
+
+ 
+
+/* Private variables ---------------------------------------------------------*/
+
+UART_HandleTypeDef huart2;
+
+ 
+
+/* USER CODE BEGIN PV */
+
+/* UART ring buffer vars */
+
+uint8_t uart_rx_byte;
+
+uint8_t uart_ring_buffer[UART_BUFFER_SIZE];
+
+volatile uint16_t head = 0;
+
+volatile uint16_t tail = 0;
+
+/* USER CODE END PV */
+
+ 
+
+/* RTOS objects --------------------------------------------------------------*/
+
+/* USER CODE BEGIN RTOS_OBJS */
+
+/* Queues */
+
+osMessageQueueId_t btnEventQueueHandle;
+
+osMessageQueueId_t logQueueHandle;
+
+ 
+
+/* Mutex */
+
+osMutexId_t myMutex01Handle;
+
+const osMutexAttr_t myMutex01_attributes = { .name = "myMutex01" };
+
+ 
+
+/* Threads */
+
+osThreadId_t ledTaskHandle;
+
+osThreadId_t uartLoggerTaskHandle;
+
+osThreadId_t buttonHandlerTaskHandle;
+
+ 
+
+const osThreadAttr_t ledTask_attributes = {
+
+  .name = "LED_Task",
+
+  .stack_size = 256 * 4,
+
+  .priority = (osPriority_t) osPriorityLow
+
+};
+
+const osThreadAttr_t uartLoggerTask_attributes = {
+
+  .name = "UART_Logger_Task",
+
+  .stack_size = 512 * 4,
+
+  .priority = (osPriority_t) osPriorityAboveNormal
+
+};
+
+const osThreadAttr_t buttonHandlerTask_attributes = {
+
+  .name = "Button_Handler_Task",
+
+  .stack_size = 256 * 4,
+
+  .priority = (osPriority_t) osPriorityHigh
+
+};
+
+/* USER CODE END RTOS_OBJS */
+
+ 
+
+/* Default CubeMX task (unused) */
+
+osThreadId_t defaultTaskHandle;
+
+const osThreadAttr_t defaultTask_attributes = {
+
+  .name = "defaultTask",
+
+  .stack_size = 128 * 4,
+
+  .priority = (osPriority_t) osPriorityNormal,
+
+};
+
+ 
+
+/* USER CODE BEGIN PV2 */
+
+static uint8_t buttonToken = 1;
+
+/* USER CODE END PV2 */
+
+ 
+
+/* Function prototypes */
+
+void SystemClock_Config(void);
+
+static void MX_GPIO_Init(void);
+
+static void MX_USART2_UART_Init(void);
+
+void StartDefaultTask(void *argument);
+
+static void LED_Task(void *argument);
+
+static void UART_Logger_Task(void *argument);
+
+static void Button_Handler_Task(void *argument);
+
+ 
+
+/* USER CODE BEGIN PFP */
+
+static void UART_Printf(const char *fmt, ...);
+
+void UART_StartReception(void);
+
+int UART_GetChar(void);
+
+/* USER CODE END PFP */
+
+ 
+
+/* USER CODE BEGIN 0 */
+
+void UART_StartReception(void) {
+
+  HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+
+}
+
+ 
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+
+  if (huart->Instance == USART2) {
+
+    uint16_t next = (head + 1) % UART_BUFFER_SIZE;
+
+    if (next != tail) { // avoid overflow
+
+      uart_ring_buffer[head] = uart_rx_byte;
+
+      head = next;
+
+    }
+
+    HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1); // restart reception
+
+  }
+
+}
+
+ 
+
+int UART_GetChar(void) {
+
+  if (head == tail) return -1; // empty
+
+  uint8_t c = uart_ring_buffer[tail];
+
+  tail = (tail + 1) % UART_BUFFER_SIZE;
+
+  return c;
+
+}
+
+/* USER CODE END 0 */
+
+ 
+
+int main(void)
+
+{
+
+  HAL_Init();
+
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+
+  MX_USART2_UART_Init();
+
+ 
+
+  /* Init scheduler */
+
+  osKernelInitialize();
+
+ 
+
+  /* Create RTOS objects */
+
+  myMutex01Handle = osMutexNew(&myMutex01_attributes);
+
+  const osMessageQueueAttr_t btnQueueAttr = { .name = "btnEventQueue" };
+
+  btnEventQueueHandle = osMessageQueueNew(8, sizeof(uint8_t), &btnQueueAttr);
+
+  const osMessageQueueAttr_t logQueueAttr = { .name = "logQueue" };
+
+  logQueueHandle = osMessageQueueNew(16, sizeof(LogItem_t), &logQueueAttr);
+
+ 
+
+  /* Tasks */
+
+  defaultTaskHandle       = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  ledTaskHandle           = osThreadNew(LED_Task, NULL, &ledTask_attributes);
+
+  uartLoggerTaskHandle    = osThreadNew(UART_Logger_Task, NULL, &uartLoggerTask_attributes);
+
+  buttonHandlerTaskHandle = osThreadNew(Button_Handler_Task, NULL, &buttonHandlerTask_attributes);
+
+ 
+
+  /* Start UART reception interrupt */
+
+  UART_StartReception();
+
+ 
+
+  /* Start scheduler */
+
+  osKernelStart();
+
+ 
+
+  while (1) {}
+
+}
+
+ 
+
+/**
+
+  * @brief System Clock Configuration
+
+  */
+
+void SystemClock_Config(void)
+
+{
+
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+ 
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+ 
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;   // NOTE: running at 16 MHz. Consider enabling PLL to 84 MHz later.
+
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
+
+ 
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+ 
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK) { Error_Handler(); }
+
+}
+
+ 
+
+/**
+
+  * @brief USART2 Initialization Function
+
+  */
+
+static void MX_USART2_UART_Init(void)
+
+{
+
+  huart2.Instance = USART2;
+
+  huart2.Init.BaudRate = 115200;
+
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+
+  huart2.Init.StopBits = UART_STOPBITS_1;
+
+  huart2.Init.Parity = UART_PARITY_NONE;
+
+  huart2.Init.Mode = UART_MODE_TX_RX;
+
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+
+  if (HAL_UART_Init(&huart2) != HAL_OK) { Error_Handler(); }
+
+}
+
+ 
+
+/**
+
+  * @brief GPIO Initialization Function
+
+  */
+
+static void MX_GPIO_Init(void)
+
+{
+
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+ 
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+ 
+
+  /* LED PA5 */
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+ 
+
+  /* Button PC13 -> EXTI Rising */
+
+  GPIO_InitStruct.Pin  = GPIO_PIN_13;
+
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+ 
+
+  /* EXTI NVIC (priority 5 is RTOS-safe for FromISR calls) */
+
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
+
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+}
+
+ 
+
+ 
+
+ 
+
+/* Clock, GPIO, UART init (same as before) ... */
+
+ 
+
+/* ================== USER FUNCTIONS ================== */
+
+static void UART_Printf(const char *fmt, ...)
+
+{
+
+  char buf[128];
+
+  va_list args;
+
+  va_start(args, fmt);
+
+  int n = vsnprintf(buf, sizeof(buf), fmt, args);
+
+  va_end(args);
+
+  if (n < 0) return;
+
+  if (n > (int)sizeof(buf)) n = sizeof(buf);
+
+ 
+
+  if (myMutex01Handle) osMutexAcquire(myMutex01Handle, osWaitForever);
+
+  HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)n, 100);
+
+  if (myMutex01Handle) osMutexRelease(myMutex01Handle);
+
+}
+
+ 
+
+/* ================== TASKS ================== */
+
+void StartDefaultTask(void *argument)
+
+{
+
+  for (;;) osDelay(1);
+
+}
+
+ 
+
+static void LED_Task(void *argument)
+
+{
+
+  for (;;) {
+
+    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+
+    osDelay(500);
+
+  }
+
+}
+
+ 
+
+static void UART_Logger_Task(void *argument)
+
+{
+
+  LogItem_t item;
+
+  UART_Printf("\r\n[BOOT] System starting...\r\n");
+
+ 
+
+  for (;;) {
+
+    /* Echo back received chars (interrupt-driven, ring buffer) */
+
+    int ch = UART_GetChar();
+
+    if (ch != -1) {
+
+      if (myMutex01Handle) osMutexAcquire(myMutex01Handle, osWaitForever);
+
+      HAL_UART_Transmit(&huart2, (uint8_t*)&ch, 1, HAL_MAX_DELAY);
+
+      if (myMutex01Handle) osMutexRelease(myMutex01Handle);
+
+    }
+
+ 
+
+    /* Drain log queue for messages from other tasks */
+
+    if (osMessageQueueGet(logQueueHandle, &item, NULL, 0) == osOK) {
+
+      UART_Printf("%s", item.msg);
+
+    }
+
+ 
+
+    osDelay(1);
+
+  }
+
+}
+
+ 
+
+static void Button_Handler_Task(void *argument)
+
+{
+
+  uint8_t token;
+
+  LogItem_t li;
+
+  for (;;) {
+
+    if (osMessageQueueGet(btnEventQueueHandle, &token, NULL, osWaitForever) == osOK) {
+
+      snprintf(li.msg, sizeof(li.msg), "[EVENT] Button Pressed\r\n");
+
+      osMessageQueuePut(logQueueHandle, &li, 0, 0);
+
+    }
+
+  }
+
+}
+
+ 
+
+/* ISR callbacks */
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+
+{
+
+  if (GPIO_Pin == GPIO_PIN_13) {
+
+    osMessageQueuePut(btnEventQueueHandle, &buttonToken, 0, 0);
+
+  }
+
+}
+
+ 
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+
+{
+
+  if (htim->Instance == TIM6) HAL_IncTick();
+
+}
+
+ 
+
+void Error_Handler(void)
+
+{
+
+  __disable_irq();
+
+  while (1) {}
+
+}
+
+ 
+
+#ifdef USE_FULL_ASSERT
+
+/**
+
+  * @brief  Reports the name of the source file and the source line number
+
+  *         where the assert_param error has occurred.
+
+  * @param  file: pointer to the source file name
+
+  * @param  line: assert_param error line source number
+
+  * @retval None
+
+  */
+
+void assert_failed(uint8_t *file, uint32_t line)
+
+{
+
+  /* USER CODE BEGIN 6 */
+
+  /* User can add his own implementation to report the file name and line number,
+
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+
+  /* USER CODE END 6 */
+
+}
+
+#endif /* USE_FULL_ASSERT */
+
